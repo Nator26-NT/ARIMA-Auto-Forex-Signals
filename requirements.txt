@@ -1,4 +1,3 @@
-Python
 streamlit
 yfinance
 pmdarima
