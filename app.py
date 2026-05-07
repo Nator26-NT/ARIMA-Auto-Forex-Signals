@@ -8,6 +8,7 @@ from pmdarima import auto_arima
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
 from dtaidistance import dtw
+import time
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -15,14 +16,8 @@ st.set_page_config(page_title="ARIMA Auto Forex", layout="wide", page_icon="⏱�
 st.title("⏱️ ARIMA – Auto Forex Signals (Every 1 Hour)")
 st.markdown("**Auto‑retrain every 1h** | **Sound notification** | **3:1 R:R** | **Only BUY/SELL 70‑80% conf**")
 
-st.components.v1.html("""
-<script>
-function playSignalSound() {
-    var audio = new Audio('https://www.soundjay.com/misc/sounds/bell-ringing-05.mp3');
-    audio.play();
-}
-</script>
-""", height=0)
+# Sound using st.audio (no JavaScript)
+sound_path = "https://www.soundjay.com/misc/sounds/bell-ringing-05.mp3"
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -47,21 +42,35 @@ if "prev_signals" not in st.session_state:
     st.session_state.prev_signals = {}
 if "last_update" not in st.session_state:
     st.session_state.last_update = datetime.now()
+if "sound_played" not in st.session_state:
+    st.session_state.sound_played = False
 
 def get_date_ranges():
     now = datetime.now()
     cy = now.year
     return f"{cy-1}-01-01", f"{cy-1}-12-31", f"{cy}-01-01", now.strftime("%Y-%m-%d")
 
-@st.cache_data(ttl=300)
-def fetch_data(pair, start, end, interval):
-    data = yf.download(pair, start=start, end=end, interval=interval, progress=False)
-    if data.empty:
-        data = yf.download(pair, start=start, end=end, interval='1d', progress=False)
-    if 'Adj Close' in data.columns:
-        data = data.drop(columns=['Adj Close'])
-    data.columns = ['open','high','low','close','volume']
-    return data
+# Custom fetch with retry and delay to avoid rate limiting
+@st.cache_data(ttl=600)
+def fetch_data(pair, start, end, interval, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            data = yf.download(pair, start=start, end=end, interval=interval, progress=False)
+            if data.empty:
+                data = yf.download(pair, start=start, end=end, interval='1d', progress=False)
+            if 'Adj Close' in data.columns:
+                data = data.drop(columns=['Adj Close'])
+            data.columns = ['open','high','low','close','volume']
+            return data
+        except Exception as e:
+            if "Rate limited" in str(e) or "Too Many Requests" in str(e):
+                wait = (attempt + 1) * 2
+                st.warning(f"Rate limit hit for {pair}. Waiting {wait} seconds...")
+                time.sleep(wait)
+            else:
+                st.error(f"Error fetching {pair}: {e}")
+                return pd.DataFrame()
+    return pd.DataFrame()
 
 def add_features(df, atr_period):
     df = df.copy()
@@ -170,16 +179,21 @@ def process_pair(pair_ticker, pair_name, interval, atr_period, risk_mult, reward
     }, None
 
 def main():
+    # Auto‑refresh every 1 hour
     if auto_update and (datetime.now() - st.session_state.last_update).total_seconds() > 3600:
         st.session_state.last_update = datetime.now()
         st.cache_data.clear()
         st.cache_resource.clear()
         st.rerun()
+    
     st.subheader("🔔 Live ARIMA Signals (Auto‑refresh every 1h)")
     results = []
     progress = st.progress(0)
     for i, (ticker, name) in enumerate(FOREX_PAIRS):
         with st.spinner(f"ARIMA on {name}..."):
+            # Small delay between pairs to reduce rate limiting
+            if i > 0:
+                time.sleep(1)
             res, err = process_pair(ticker, name, interval, atr_period, risk_mult, reward_ratio, min_conf)
         if res:
             results.append(res)
@@ -187,13 +201,18 @@ def main():
             st.warning(err)
         progress.progress((i+1)/len(FOREX_PAIRS))
     progress.empty()
+    
+    # Play sound if new signals appear (using st.audio)
     current_keys = {f"{r['pair']}_{r['signal']}" for r in results}
     if current_keys and current_keys != st.session_state.prev_signals:
-        st.components.v1.html("<script>var audio=new Audio('https://www.soundjay.com/misc/sounds/bell-ringing-05.mp3');audio.play();</script>", height=0)
+        st.audio(sound_path, format="audio/mpeg", autoplay=True)
         st.session_state.prev_signals = current_keys
+        st.session_state.sound_played = True
+    
     if not results:
         st.info("No BUY/SELL signals in 70-80% range. Waiting for next update.")
         return
+    
     tabs = st.tabs([f"{r['pair']} – {r['signal']} (conf={r['confidence']:.2f})" for r in results])
     for tab, r in zip(tabs, results):
         with tab:
@@ -203,6 +222,7 @@ def main():
             col3.metric("Price", f"{r['price']:.5f}")
             st.code(f"{r['signal']} {r['ticker'].replace('=X','')} at {r['price']:.5f}\nTP: {r['tp']:.5f}\nSL: {r['sl']:.5f}\nForecast: {r['forecast']:.5f}\nVal MSE: {r['val_mse']:.6f}", language="text")
             st.success("✅ Signal ready")
+    
     next_update = st.session_state.last_update + timedelta(hours=1)
     remaining = (next_update - datetime.now()).total_seconds() / 60
     st.caption(f"Next auto‑update in {remaining:.0f} minutes.")
